@@ -1,0 +1,12 @@
+{
+  "name": "helpdesk-status",
+  "version": "1.0.0",
+  "description": "Simple open/closed status board for a school helpdesk",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}
