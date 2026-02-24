@@ -583,12 +583,19 @@ app.get('/', (req, res) => {
     .card-status { font-size: 2.2rem; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em; }
     .card-sub    { font-size: 0.85rem; color: rgba(255,255,255,0.65); }
     #empty       { color: #555; font-size: 1rem; }
+    #clock       { font-size: 1.1rem; font-variant-numeric: tabular-nums; letter-spacing: 0.08em; color: rgba(255,255,255,0.4); }
   </style>
 </head>
 <body>
   <h1>Help Desk Status</h1>
+  <div id="clock"></div>
   <div id="grid"></div>
   <script>
+    (function tickClock() {
+      document.getElementById('clock').textContent =
+        new Date().toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      setTimeout(tickClock, 1000 - (Date.now() % 1000));
+    })();
     function esc(s) {
       return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
     }
@@ -670,13 +677,26 @@ app.get('/site/:id', (req, res) => {
     }
     .open   { background-color: #1a7a3a; }
     .closed { background-color: #b71c1c; }
+    #clock  {
+      margin-top: 2.5rem;
+      font-size: clamp(1.1rem, 3vw, 1.8rem);
+      font-variant-numeric: tabular-nums;
+      letter-spacing: 0.12em;
+      color: rgba(255,255,255,0.55);
+    }
   </style>
 </head>
 <body class="open">
   <div id="site-name">${escHtml(site.name)}</div>
   <div id="status-text">Help Desk is Open</div>
   <div id="subtitle">Walk-ins welcome</div>
+  <div id="clock"></div>
   <script>
+    (function tickClock() {
+      document.getElementById('clock').textContent =
+        new Date().toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      setTimeout(tickClock, 1000 - (Date.now() % 1000));
+    })();
     const SITE_ID = ${JSON.stringify(site.id)};
     function applyStatus(isOpen) {
       document.body.className = isOpen ? 'open' : 'closed';
@@ -786,6 +806,7 @@ app.get('/admin', requireAuth, (req, res) => {
     #add-btn:hover { background: #b4d0fb; }
     #feedback { font-size: 0.9rem; color: #a6adc8; min-height: 1.2rem; }
     .empty-msg { color: #585b70; font-size: 0.95rem; text-align: center; padding: 0.8rem; }
+    #clock     { font-size: 0.9rem; font-variant-numeric: tabular-nums; letter-spacing: 0.05em; color: #6c7086; }
   </style>
 </head>
 <body>
@@ -795,6 +816,7 @@ app.get('/admin', requireAuth, (req, res) => {
     <a href="/admin/report">&#128202; Reports</a>
     ${userInfo}
   </div>
+  <div id="clock"></div>
   <div id="sites-list"></div>
   <div id="add-form">
     <input id="new-site-name" type="text" placeholder="New site name (e.g. North Campus)" maxlength="80">
@@ -903,6 +925,11 @@ app.get('/admin', requireAuth, (req, res) => {
     });
     loadSites();
     setInterval(loadSites, 10000);
+    (function tickClock() {
+      document.getElementById('clock').textContent =
+        new Date().toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      setTimeout(tickClock, 1000 - (Date.now() % 1000));
+    })();
   </script>
 </body>
 </html>`);
@@ -1026,6 +1053,7 @@ app.get('/admin/report', requireAuth, (req, res) => {
     .bar-fill { background: #1a7a3a; border-radius: 4px; height: 7px; }
     .pct-val  { font-size: 0.83rem; color: #a6e3a1; font-weight: 700; white-space: nowrap; }
     #error-msg { font-size: 0.9rem; color: #f38ba8; min-height: 1.2rem; }
+    #clock     { font-size: 0.9rem; font-variant-numeric: tabular-nums; letter-spacing: 0.05em; color: #6c7086; }
   </style>
 </head>
 <body>
@@ -1034,6 +1062,7 @@ app.get('/admin/report', requireAuth, (req, res) => {
     <a href="/admin">&#8592; Back to Admin</a>
     ${userInfo}
   </div>
+  <div id="clock"></div>
 
   <!-- Per-site business hours config -->
   <div class="card">
@@ -1269,6 +1298,11 @@ app.get('/admin/report', requireAuth, (req, res) => {
       const today = new Date();
       document.getElementById('from-date').value = localDateStr(new Date(today.getFullYear(), today.getMonth(), 1));
       document.getElementById('to-date').value   = localDateStr(today);
+    })();
+    (function tickClock() {
+      document.getElementById('clock').textContent =
+        new Date().toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      setTimeout(tickClock, 1000 - (Date.now() % 1000));
     })();
   </script>
 </body>
