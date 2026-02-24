@@ -22,21 +22,23 @@ function loadState() {
     // Migrate legacy single-site format { isOpen: bool }
     if (typeof raw.isOpen === 'boolean' && !raw.sites) {
       return {
-        sites: [{ id: 'main', name: 'Help Desk', isOpen: raw.isOpen }],
-        businessHours: defaultBusinessHours(),
+        sites: [{ id: 'main', name: 'Help Desk', isOpen: raw.isOpen, businessHours: defaultBusinessHours() }],
         events: [{ siteId: 'main', isOpen: raw.isOpen, ts: Date.now() }],
       };
     }
-    // Fill in fields added in newer versions
-    if (!raw.businessHours) raw.businessHours = defaultBusinessHours();
+    // Migrate global businessHours down to each site (v2 → v3)
+    const globalBH = raw.businessHours || defaultBusinessHours();
+    for (const site of raw.sites) {
+      if (!site.businessHours) site.businessHours = { ...globalBH };
+    }
+    delete raw.businessHours;
     if (!raw.events) {
       raw.events = raw.sites.map(s => ({ siteId: s.id, isOpen: s.isOpen, ts: Date.now() }));
     }
     return raw;
   } catch {
     return {
-      sites: [{ id: 'main', name: 'Help Desk', isOpen: true }],
-      businessHours: defaultBusinessHours(),
+      sites: [{ id: 'main', name: 'Help Desk', isOpen: true, businessHours: defaultBusinessHours() }],
       events: [{ siteId: 'main', isOpen: true, ts: Date.now() }],
     };
   }
@@ -146,7 +148,7 @@ app.get('/api/sites', (req, res) => {
 app.post('/api/sites', (req, res) => {
   const name = (req.body.name || '').trim();
   if (!name) return res.status(400).json({ error: 'name is required' });
-  const site = { id: uniqueId(name), name, isOpen: true };
+  const site = { id: uniqueId(name), name, isOpen: true, businessHours: defaultBusinessHours() };
   state.sites.push(site);
   state.events.push({ siteId: site.id, isOpen: true, ts: Date.now() });
   saveState();
@@ -174,18 +176,16 @@ app.post('/api/sites/:id/toggle', (req, res) => {
 // API – business hours & reporting
 // ---------------------------------------------------------------------------
 
-app.get('/api/business-hours', (req, res) => {
-  res.json(state.businessHours);
-});
-
-app.post('/api/business-hours', (req, res) => {
+app.post('/api/sites/:id/business-hours', (req, res) => {
+  const site = state.sites.find(s => s.id === req.params.id);
+  if (!site) return res.status(404).json({ error: 'not found' });
   const { start, end, days } = req.body;
   if (!start || !end || !Array.isArray(days)) {
     return res.status(400).json({ error: 'start, end, and days are required' });
   }
-  state.businessHours = { start, end, days: days.map(Number) };
+  site.businessHours = { start, end, days: days.map(Number) };
   saveState();
-  res.json(state.businessHours);
+  res.json(site.businessHours);
 });
 
 app.get('/api/report', (req, res) => {
@@ -201,14 +201,13 @@ app.get('/api/report', (req, res) => {
     return res.status(400).json({ error: 'invalid date range' });
   }
 
-  const bh = state.businessHours;
-  const totalBizMins = Math.round(calcBusinessMinutes(fromMs, toMs, bh));
-
   const sites = state.sites.map(site => {
+    const bh = site.businessHours || defaultBusinessHours();
+    const totalBizMins = Math.round(calcBusinessMinutes(fromMs, toMs, bh));
     const { openMins, closedMins } = calcSiteReport(site.id, fromMs, toMs, bh);
     return {
-      id:          site.id,
-      name:        site.name,
+      id:   site.id,
+      name: site.name,
       openMins,
       closedMins,
       totalBizMins,
@@ -216,7 +215,7 @@ app.get('/api/report', (req, res) => {
     };
   });
 
-  res.json({ from, to, totalBizMins, sites });
+  res.json({ from, to, sites });
 });
 
 // ---------------------------------------------------------------------------
@@ -606,34 +605,43 @@ app.get('/admin/report', (req, res) => {
       border-radius: 0.75rem;
       padding: 1.4rem 1.6rem;
       width: 100%;
-      max-width: 680px;
+      max-width: 720px;
     }
 
-    /* ---- business hours form ---- */
-    .bh-form  { display: flex; flex-direction: column; gap: 1rem; }
-    .row-label { font-size: 0.82rem; color: #a6adc8; margin-bottom: 0.4rem; }
+    /* ---- per-site business hours ---- */
+    .site-bh-row {
+      padding: 1rem 0;
+      border-bottom: 1px solid #313244;
+      display: flex;
+      flex-direction: column;
+      gap: 0.6rem;
+    }
+    .site-bh-row:first-child { padding-top: 0; }
+    .site-bh-row:last-child  { border-bottom: none; padding-bottom: 0; }
+    .site-bh-name { font-size: 1rem; font-weight: 600; }
     .days-row { display: flex; gap: 0.4rem; flex-wrap: wrap; }
     .day-btn {
-      padding: 0.35rem 0.65rem;
+      padding: 0.3rem 0.6rem;
       border-radius: 0.4rem;
       border: 1px solid #45475a;
       background: #1e1e2e;
       color: #a6adc8;
       cursor: pointer;
-      font-size: 0.83rem;
+      font-size: 0.82rem;
       transition: background 0.15s, color 0.15s, border-color 0.15s;
     }
     .day-btn.active { background: #89b4fa; color: #1e1e2e; border-color: #89b4fa; font-weight: 700; }
-    .time-row { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; }
-    .time-row label { font-size: 0.88rem; color: #a6adc8; }
+    .time-row { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
+    .time-row label { font-size: 0.85rem; color: #a6adc8; }
     input[type="time"], input[type="date"] {
       background: #1e1e2e;
       border: 1px solid #45475a;
       border-radius: 0.4rem;
       color: #cdd6f4;
-      padding: 0.4rem 0.65rem;
-      font-size: 0.92rem;
+      padding: 0.38rem 0.6rem;
+      font-size: 0.9rem;
     }
+    .empty-msg { color: #585b70; font-size: 0.9rem; }
 
     /* ---- date range ---- */
     .range-form { display: flex; flex-direction: column; gap: 1rem; }
@@ -655,25 +663,25 @@ app.get('/admin/report', (req, res) => {
     /* ---- buttons ---- */
     .btn {
       background: #89b4fa; color: #1e1e2e; border: none;
-      border-radius: 0.5rem; padding: 0.55rem 1.3rem;
-      font-size: 0.95rem; font-weight: 700; cursor: pointer;
+      border-radius: 0.5rem; padding: 0.5rem 1.2rem;
+      font-size: 0.92rem; font-weight: 700; cursor: pointer;
     }
     .btn:hover { background: #b4d0fb; }
-    .inline-note { margin-left: 0.75rem; font-size: 0.82rem; color: #a6adc8; }
+    .inline-note { margin-left: 0.6rem; font-size: 0.8rem; color: #a6adc8; }
 
     /* ---- results table ---- */
     .summary { font-size: 0.88rem; color: #a6adc8; margin-bottom: 1.1rem; }
     table { width: 100%; border-collapse: collapse; }
     th {
-      font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.06em;
-      color: #6c7086; padding: 0.45rem 0.75rem; text-align: left;
+      font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.06em;
+      color: #6c7086; padding: 0.45rem 0.65rem; text-align: left;
       border-bottom: 1px solid #313244;
     }
-    td { padding: 0.7rem 0.75rem; font-size: 0.93rem; border-bottom: 1px solid #1e1e2e; }
-    .bar-wrap { display: flex; align-items: center; gap: 0.6rem; }
-    .bar-bg   { flex: 1; background: #1e1e2e; border-radius: 4px; height: 8px; min-width: 60px; }
-    .bar-fill { background: #1a7a3a; border-radius: 4px; height: 8px; }
-    .pct-val  { font-size: 0.85rem; color: #a6e3a1; font-weight: 700; white-space: nowrap; }
+    td { padding: 0.65rem 0.65rem; font-size: 0.9rem; border-bottom: 1px solid #1e1e2e; }
+    .bar-wrap { display: flex; align-items: center; gap: 0.5rem; }
+    .bar-bg   { flex: 1; background: #1e1e2e; border-radius: 4px; height: 7px; min-width: 50px; }
+    .bar-fill { background: #1a7a3a; border-radius: 4px; height: 7px; }
+    .pct-val  { font-size: 0.83rem; color: #a6e3a1; font-weight: 700; white-space: nowrap; }
     #error-msg { font-size: 0.9rem; color: #f38ba8; min-height: 1.2rem; }
   </style>
 </head>
@@ -681,33 +689,10 @@ app.get('/admin/report', (req, res) => {
   <h1>Help Desk Reports</h1>
   <a class="back" href="/admin">&#8592; Back to Admin</a>
 
-  <!-- Business hours config -->
+  <!-- Per-site business hours config -->
   <div class="card">
     <h2>Business Hours</h2>
-    <div class="bh-form">
-      <div>
-        <div class="row-label">Active Days</div>
-        <div class="days-row">
-          <button class="day-btn" data-day="0">Sun</button>
-          <button class="day-btn" data-day="1">Mon</button>
-          <button class="day-btn" data-day="2">Tue</button>
-          <button class="day-btn" data-day="3">Wed</button>
-          <button class="day-btn" data-day="4">Thu</button>
-          <button class="day-btn" data-day="5">Fri</button>
-          <button class="day-btn" data-day="6">Sat</button>
-        </div>
-      </div>
-      <div class="time-row">
-        <label for="bh-start">Open</label>
-        <input type="time" id="bh-start" value="08:00">
-        <label for="bh-end">Close</label>
-        <input type="time" id="bh-end" value="17:00">
-      </div>
-      <div>
-        <button class="btn" id="save-bh">Save</button>
-        <span class="inline-note" id="bh-note"></span>
-      </div>
-    </div>
+    <div id="bh-container"><p class="empty-msg">Loading\u2026</p></div>
   </div>
 
   <!-- Date range + generate -->
@@ -741,8 +726,9 @@ app.get('/admin/report', (req, res) => {
       <thead>
         <tr>
           <th>Site</th>
-          <th>Open (biz hrs)</th>
-          <th>Closed (biz hrs)</th>
+          <th>Biz Hrs Total</th>
+          <th>Open</th>
+          <th>Closed</th>
           <th>Open %</th>
         </tr>
       </thead>
@@ -763,51 +749,82 @@ app.get('/admin/report', (req, res) => {
       return h + 'h' + (min > 0 ? ' ' + min + 'm' : '');
     }
     function localDateStr(d) {
-      const y = d.getFullYear();
-      const m = String(d.getMonth() + 1).padStart(2, '0');
-      const day = String(d.getDate()).padStart(2, '0');
-      return y + '-' + m + '-' + day;
+      return d.getFullYear() + '-' +
+        String(d.getMonth() + 1).padStart(2, '0') + '-' +
+        String(d.getDate()).padStart(2, '0');
     }
 
-    // ---- business hours ----
-    let activeDays = new Set([1, 2, 3, 4, 5]);
+    // ---- per-site business hours ----
+    let sitesData = [];
 
-    async function loadBH() {
+    async function loadSites() {
       try {
-        const bh = await fetch('/api/business-hours').then(r => r.json());
-        document.getElementById('bh-start').value = bh.start;
-        document.getElementById('bh-end').value   = bh.end;
-        activeDays = new Set(bh.days);
-        document.querySelectorAll('.day-btn').forEach(btn => {
-          btn.classList.toggle('active', activeDays.has(Number(btn.dataset.day)));
-        });
-      } catch (e) {}
+        sitesData = await fetch('/api/sites').then(r => r.json());
+        renderBHForms();
+      } catch (e) {
+        document.getElementById('bh-container').textContent = 'Could not load sites.';
+      }
     }
 
-    document.querySelectorAll('.day-btn').forEach(btn => {
-      btn.addEventListener('click', () => {
-        const d = Number(btn.dataset.day);
-        if (activeDays.has(d)) activeDays.delete(d); else activeDays.add(d);
-        btn.classList.toggle('active', activeDays.has(d));
-      });
-    });
+    function renderBHForms() {
+      const container = document.getElementById('bh-container');
+      container.innerHTML = '';
+      if (sitesData.length === 0) {
+        container.innerHTML = '<p class="empty-msg">No sites configured. Add sites from the <a href="/admin" style="color:#89b4fa">Admin</a> panel.</p>';
+        return;
+      }
+      for (const site of sitesData) {
+        const bh = site.businessHours || { start: '08:00', end: '17:00', days: [1,2,3,4,5] };
+        const activeDays = new Set(bh.days); // per-site, captured in closure
 
-    document.getElementById('save-bh').addEventListener('click', async () => {
-      const note = document.getElementById('bh-note');
-      try {
-        await fetch('/api/business-hours', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            start: document.getElementById('bh-start').value,
-            end:   document.getElementById('bh-end').value,
-            days:  [...activeDays],
-          }),
+        const row = document.createElement('div');
+        row.className = 'site-bh-row';
+        row.innerHTML =
+          '<div class="site-bh-name">' + esc(site.name) + '</div>' +
+          '<div class="days-row">' +
+            [['Sun',0],['Mon',1],['Tue',2],['Wed',3],['Thu',4],['Fri',5],['Sat',6]].map(([lbl, i]) =>
+              '<button class="day-btn' + (activeDays.has(i) ? ' active' : '') + '" data-day="' + i + '">' + lbl + '</button>'
+            ).join('') +
+          '</div>' +
+          '<div class="time-row">' +
+            '<label>Open</label>' +
+            '<input type="time" class="bh-start" value="' + esc(bh.start) + '">' +
+            '<label>Close</label>' +
+            '<input type="time" class="bh-end" value="' + esc(bh.end) + '">' +
+            '<button class="btn save-bh-btn">Save</button>' +
+            '<span class="inline-note bh-note"></span>' +
+          '</div>';
+
+        row.querySelectorAll('.day-btn').forEach(btn => {
+          btn.addEventListener('click', () => {
+            const d = Number(btn.dataset.day);
+            if (activeDays.has(d)) activeDays.delete(d); else activeDays.add(d);
+            btn.classList.toggle('active', activeDays.has(d));
+          });
         });
-        note.textContent = 'Saved!';
-        setTimeout(() => { note.textContent = ''; }, 2000);
-      } catch (e) { note.textContent = 'Error saving.'; }
-    });
+
+        row.querySelector('.save-bh-btn').addEventListener('click', async () => {
+          const note = row.querySelector('.bh-note');
+          try {
+            const updated = await fetch('/api/sites/' + site.id + '/business-hours', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                start: row.querySelector('.bh-start').value,
+                end:   row.querySelector('.bh-end').value,
+                days:  [...activeDays],
+              }),
+            }).then(r => r.json());
+            const s = sitesData.find(s => s.id === site.id);
+            if (s) s.businessHours = updated;
+            note.textContent = 'Saved!';
+            setTimeout(() => { note.textContent = ''; }, 2000);
+          } catch (e) { note.querySelector('.bh-note').textContent = 'Error saving.'; }
+        });
+
+        container.appendChild(row);
+      }
+    }
 
     // ---- date presets ----
     document.querySelectorAll('.preset-btn').forEach(btn => {
@@ -817,7 +834,7 @@ app.get('/admin/report', (req, res) => {
         switch (btn.dataset.preset) {
           case 'this-week': {
             const dow = today.getDay();
-            const diff = dow === 0 ? -6 : 1 - dow; // back to Monday
+            const diff = dow === 0 ? -6 : 1 - dow;
             from = new Date(today); from.setDate(today.getDate() + diff);
             to   = today; break;
           }
@@ -850,8 +867,8 @@ app.get('/admin/report', (req, res) => {
 
     // ---- generate report ----
     document.getElementById('gen-btn').addEventListener('click', async () => {
-      const from = document.getElementById('from-date').value;
-      const to   = document.getElementById('to-date').value;
+      const from  = document.getElementById('from-date').value;
+      const to    = document.getElementById('to-date').value;
       const errEl = document.getElementById('error-msg');
       errEl.textContent = '';
       if (!from || !to) { errEl.textContent = 'Please select a date range.'; return; }
@@ -863,13 +880,10 @@ app.get('/admin/report', (req, res) => {
     });
 
     function renderReport(data, from, to) {
-      const card    = document.getElementById('results-card');
       const summary = document.getElementById('results-summary');
       const body    = document.getElementById('results-body');
 
-      summary.textContent =
-        from + ' \u2013 ' + to +
-        ' \u00b7 ' + fmtMins(data.totalBizMins) + ' total business hours in period';
+      summary.textContent = from + ' \u2013 ' + to;
 
       body.innerHTML = '';
       for (const site of data.sites) {
@@ -877,8 +891,9 @@ app.get('/admin/report', (req, res) => {
         const tr  = document.createElement('tr');
         tr.innerHTML =
           '<td>' + esc(site.name) + '</td>' +
-          '<td style="color:#a6e3a1">' + fmtMins(site.openMins) + '</td>' +
-          '<td style="color:#f38ba8">' + fmtMins(site.closedMins) + '</td>' +
+          '<td style="color:#a6adc8">'  + fmtMins(site.totalBizMins) + '</td>' +
+          '<td style="color:#a6e3a1">'  + fmtMins(site.openMins)     + '</td>' +
+          '<td style="color:#f38ba8">'  + fmtMins(site.closedMins)   + '</td>' +
           '<td>' +
             '<div class="bar-wrap">' +
               '<div class="bar-bg"><div class="bar-fill" style="width:' + Math.min(pct, 100) + '%"></div></div>' +
@@ -887,13 +902,12 @@ app.get('/admin/report', (req, res) => {
           '</td>';
         body.appendChild(tr);
       }
-      card.style.display = '';
-      card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      document.getElementById('results-card').style.display = '';
+      document.getElementById('results-card').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     }
 
     // ---- init ----
-    loadBH();
-    // Default to current month
+    loadSites();
     (function() {
       const today = new Date();
       document.getElementById('from-date').value = localDateStr(new Date(today.getFullYear(), today.getMonth(), 1));
