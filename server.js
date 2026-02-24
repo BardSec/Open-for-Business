@@ -209,17 +209,25 @@ pruneEvents(); // prune stale events on startup
 // ---------------------------------------------------------------------------
 
 function checkBusinessHours() {
-  const now  = new Date();
-  const day  = now.getDay();                  // 0 = Sunday … 6 = Saturday
-  const hhmm = now.toTimeString().slice(0, 5); // 'HH:MM' — sorts correctly
-  let changed = false;
+  const now     = new Date();
+  const day     = now.getDay();                          // 0 = Sun … 6 = Sat
+  const nowMins = now.getHours() * 60 + now.getMinutes(); // minutes since midnight
+  let changed   = false;
 
   for (const site of state.sites) {
     if (!site.isOpen) continue; // already closed — nothing to do
 
-    const bh     = site.businessHours || defaultBusinessHours();
-    const inDay  = bh.days.includes(day);
-    const inTime = hhmm >= bh.start && hhmm < bh.end;
+    const bh = site.businessHours || defaultBusinessHours();
+
+    // Convert "HH:MM" strings → minutes since midnight for a simple numeric range check.
+    const [startH, startM] = bh.start.split(':').map(Number);
+    const [endH,   endM  ] = bh.end.split(':').map(Number);
+    const startMins = startH * 60 + startM;
+    const endMins   = endH   * 60 + endM;
+
+    // Map days to numbers to guard against any string/number type mismatch in stored state.
+    const inDay  = bh.days.map(Number).includes(day);
+    const inTime = nowMins >= startMins && nowMins < endMins;
 
     if (!inDay || !inTime) {
       site.isOpen = false;
