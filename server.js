@@ -200,6 +200,41 @@ function escHtml(str) {
 let state = loadState();
 pruneEvents(); // prune stale events on startup
 
+// ---------------------------------------------------------------------------
+// Business-hours auto-close
+// Runs every minute; closes any site that is open but outside its configured
+// hours. Opening is always manual — this is purely a safety-net auto-close.
+// Times are compared against server-local time, so make sure the host TZ
+// matches the school's timezone (set TZ= in compose.yaml if needed).
+// ---------------------------------------------------------------------------
+
+function checkBusinessHours() {
+  const now  = new Date();
+  const day  = now.getDay();                  // 0 = Sunday … 6 = Saturday
+  const hhmm = now.toTimeString().slice(0, 5); // 'HH:MM' — sorts correctly
+  let changed = false;
+
+  for (const site of state.sites) {
+    if (!site.isOpen) continue; // already closed — nothing to do
+
+    const bh     = site.businessHours || defaultBusinessHours();
+    const inDay  = bh.days.includes(day);
+    const inTime = hhmm >= bh.start && hhmm < bh.end;
+
+    if (!inDay || !inTime) {
+      site.isOpen = false;
+      state.events.push({ siteId: site.id, isOpen: false, ts: Date.now(), auto: true });
+      changed = true;
+      console.log(`[SCHEDULE] Auto-closed "${site.name}" — outside business hours (${bh.days.join(',')} ${bh.start}–${bh.end})`);
+    }
+  }
+
+  if (changed) saveState();
+}
+
+checkBusinessHours(); // run immediately so a restart outside hours closes sites
+setInterval(checkBusinessHours, 60 * 1000).unref(); // then every minute
+
 // Prune and save once a day so the event log doesn't grow unbounded
 setInterval(() => { pruneEvents(); saveState(); }, 24 * 60 * 60 * 1000).unref();
 
