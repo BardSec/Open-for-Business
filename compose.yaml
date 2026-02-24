@@ -7,6 +7,10 @@ services:
     environment:
       - STATE_FILE=/app/state/state.json
       - NODE_ENV=production
+      # Set this to your school's IANA timezone so the auto-close scheduler
+      # uses local time. Find yours at: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
+      # Examples: Europe/London  America/New_York  America/Chicago  America/Los_Angeles
+      - TZ=Europe/London
     volumes:
       - helpdesk-state:/app/state
     restart: unless-stopped

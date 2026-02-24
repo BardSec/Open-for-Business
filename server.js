@@ -509,6 +509,16 @@ app.post('/api/sites/:id/business-hours', requireAuth, requireXHR, rateLimit, (r
   res.json(site.businessHours);
 });
 
+// Returns the server's current local time and timezone — used by the admin UI
+// so staff can see at a glance whether TZ= is configured correctly.
+app.get('/api/server-time', requireAuth, (req, res) => {
+  const now = new Date();
+  res.json({
+    time: now.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }),
+    tz:   Intl.DateTimeFormat().resolvedOptions().timeZone,
+  });
+});
+
 app.get('/api/report', requireAuth, rateLimit, (req, res) => {
   const { from, to } = req.query;
   if (!from || !to) return res.status(400).json({ error: 'from and to are required' });
@@ -1061,7 +1071,11 @@ app.get('/admin/report', requireAuth, (req, res) => {
     .bar-fill { background: #1a7a3a; border-radius: 4px; height: 7px; }
     .pct-val  { font-size: 0.83rem; color: #a6e3a1; font-weight: 700; white-space: nowrap; }
     #error-msg { font-size: 0.9rem; color: #f38ba8; min-height: 1.2rem; }
-    #clock     { font-size: 0.9rem; font-variant-numeric: tabular-nums; letter-spacing: 0.05em; color: #6c7086; }
+    #clock          { font-size: 0.9rem; font-variant-numeric: tabular-nums; letter-spacing: 0.05em; color: #6c7086; }
+    .server-tz-note { font-size: 0.8rem; color: #6c7086; margin-bottom: 1rem; }
+    .server-tz-note strong { color: #a6adc8; font-variant-numeric: tabular-nums; }
+    .server-tz-note { font-size: 0.8rem; color: #6c7086; margin-bottom: 1rem; }
+    .server-tz-note strong { font-variant-numeric: tabular-nums; color: #a6adc8; }
   </style>
 </head>
 <body>
@@ -1075,6 +1089,11 @@ app.get('/admin/report', requireAuth, (req, res) => {
   <!-- Per-site business hours config -->
   <div class="card">
     <h2>Business Hours</h2>
+    <p class="server-tz-note">
+      Auto-close scheduler uses server time:
+      <strong id="server-clock">\u2026</strong>
+      &mdash; timezone: <strong id="server-tz">\u2026</strong>
+    </p>
     <div id="bh-container"><p class="empty-msg">Loading\u2026</p></div>
   </div>
 
@@ -1311,6 +1330,15 @@ app.get('/admin/report', requireAuth, (req, res) => {
       document.getElementById('clock').textContent =
         new Date().toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
       setTimeout(tickClock, 1000 - (Date.now() % 1000));
+    })();
+    // Polls the server's current local time so admins can spot a timezone mismatch
+    (async function tickServerClock() {
+      try {
+        const d = await apiFetch('/api/server-time').then(r => r.json());
+        document.getElementById('server-clock').textContent = d.time;
+        document.getElementById('server-tz').textContent    = d.tz;
+      } catch { /* ignore */ }
+      setTimeout(tickServerClock, 1000);
     })();
   </script>
 </body>
