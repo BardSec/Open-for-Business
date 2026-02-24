@@ -1,12 +1,91 @@
-const express = require('express');
-const fs = require('fs');
-const path = require('path');
+'use strict';
 
-const app = express();
+const express    = require('express');
+const crypto     = require('crypto');
+const fs         = require('fs');
+const path       = require('path');
+const session    = require('express-session');
+const { Issuer, generators } = require('openid-client');
+
+const app  = express();
 const PORT = process.env.PORT || 3000;
 const STATE_FILE = process.env.STATE_FILE || path.join(__dirname, 'state.json');
 
-app.use(express.json());
+// ---------------------------------------------------------------------------
+// Auth configuration
+// ---------------------------------------------------------------------------
+
+// OIDC (Microsoft Entra / Google / any OpenID Connect provider)
+// Set all three env vars to enable OIDC SSO; otherwise falls back to Basic Auth.
+//   OIDC_ISSUER       – discovery URL, e.g.:
+//                         Google:    https://accounts.google.com
+//                         Microsoft: https://login.microsoftonline.com/{tenant}/v2.0
+//   OIDC_CLIENT_ID    – OAuth2 app / client ID
+//   OIDC_CLIENT_SECRET
+//   OIDC_REDIRECT_URI – defaults to http://localhost:{PORT}/auth/callback
+//   SESSION_SECRET    – random secret for signing session cookies (auto-generated if unset)
+
+const OIDC_REDIRECT_URI = process.env.OIDC_REDIRECT_URI ||
+  `http://localhost:${PORT}/auth/callback`;
+
+let SESSION_SECRET = process.env.SESSION_SECRET || '';
+if (!SESSION_SECRET) {
+  SESSION_SECRET = crypto.randomBytes(32).toString('hex');
+  console.warn('[SECURITY] SESSION_SECRET not set — sessions will not survive restarts.');
+}
+
+// Basic Auth fallback (only used when OIDC is not configured)
+let ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
+if (!ADMIN_PASSWORD) {
+  ADMIN_PASSWORD = crypto.randomBytes(16).toString('hex');
+  console.warn('[SECURITY] ADMIN_PASSWORD not set — using a one-time random password.');
+  console.warn(`[SECURITY] Admin password: ${ADMIN_PASSWORD}`);
+  console.warn('[SECURITY] Set ADMIN_PASSWORD env var to make it persistent.');
+}
+
+// Filled in by initOIDC() if env vars are present
+let oidcClient = null;
+
+async function initOIDC() {
+  const { OIDC_ISSUER, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET } = process.env;
+  const present = [OIDC_ISSUER, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET].filter(Boolean).length;
+
+  if (present === 0) {
+    console.warn('[AUTH] OIDC not configured — falling back to HTTP Basic Auth.');
+    console.warn('[AUTH] Set OIDC_ISSUER, OIDC_CLIENT_ID, and OIDC_CLIENT_SECRET to enable SSO.');
+    return;
+  }
+  if (present < 3) {
+    console.error('[AUTH] Partial OIDC config — set all of: OIDC_ISSUER, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET');
+    process.exit(1);
+  }
+
+  try {
+    const issuer = await Issuer.discover(OIDC_ISSUER);
+    oidcClient = new issuer.Client({
+      client_id:     OIDC_CLIENT_ID,
+      client_secret: OIDC_CLIENT_SECRET,
+      redirect_uris: [OIDC_REDIRECT_URI],
+      response_types: ['code'],
+    });
+    console.log(`[AUTH] OIDC SSO configured. Issuer: ${issuer.metadata.issuer}`);
+  } catch (err) {
+    console.error(`[AUTH] OIDC discovery failed: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+const MAX_SITES          = 50;
+const MAX_NAME_LEN       = 80;
+const MAX_RANGE_MS       = 2 * 365.25 * 24 * 60 * 60 * 1000; // ~2 years
+const EVENT_RETENTION_MS = MAX_RANGE_MS;
+const RATE_LIMIT_MAX     = 60;     // requests per window per IP
+const RATE_LIMIT_WINDOW  = 60_000; // 1 minute in ms
+const TIME_RE            = /^\d{2}:\d{2}$/;
 
 // ---------------------------------------------------------------------------
 // State persistence
@@ -44,10 +123,35 @@ function loadState() {
   }
 }
 
+// Atomic write: write to a temp file then rename, so a crash mid-write
+// never leaves a truncated state.json.
 function saveState() {
   const dir = path.dirname(STATE_FILE);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+  const tmp = STATE_FILE + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
+  fs.renameSync(tmp, STATE_FILE);
+}
+
+// Keep only events within the retention window, plus one anchor event per
+// site just before the cutoff so report calculations at the window edge work.
+function pruneEvents() {
+  const cutoff = Date.now() - EVENT_RETENTION_MS;
+  const byId = new Map();
+  for (const e of state.events) {
+    if (!byId.has(e.siteId)) byId.set(e.siteId, []);
+    byId.get(e.siteId).push(e);
+  }
+  const pruned = [];
+  for (const [, evts] of byId) {
+    evts.sort((a, b) => a.ts - b.ts);
+    const inWindow = evts.filter(e => e.ts >= cutoff);
+    const before   = evts.filter(e => e.ts < cutoff);
+    const anchor   = before.length ? before[before.length - 1] : null;
+    if (anchor) pruned.push(anchor);
+    pruned.push(...inWindow);
+  }
+  state.events = pruned;
 }
 
 function slugify(name) {
@@ -72,22 +176,23 @@ function escHtml(str) {
 }
 
 let state = loadState();
+pruneEvents(); // prune stale events on startup
+
+// Prune and save once a day so the event log doesn't grow unbounded
+setInterval(() => { pruneEvents(); saveState(); }, 24 * 60 * 60 * 1000).unref();
 
 // ---------------------------------------------------------------------------
 // Report calculation
 // ---------------------------------------------------------------------------
 
-// Returns the number of minutes that fall within business hours in [fromMs, toMs].
 function calcBusinessMinutes(fromMs, toMs, bh) {
   if (toMs <= fromMs) return 0;
   const [startH, startM] = bh.start.split(':').map(Number);
   const [endH, endM]     = bh.end.split(':').map(Number);
   const daySet = new Set(bh.days);
   let totalMs = 0;
-
   const cursor = new Date(fromMs);
   cursor.setHours(0, 0, 0, 0);
-
   while (cursor.getTime() < toMs) {
     if (daySet.has(cursor.getDay())) {
       const dayStart = new Date(cursor); dayStart.setHours(startH, startM, 0, 0);
@@ -101,41 +206,161 @@ function calcBusinessMinutes(fromMs, toMs, bh) {
   return totalMs / 60000;
 }
 
-// Returns { openMins, closedMins } for a site over [fromMs, toMs], counting
-// only time that falls within business hours.
 function calcSiteReport(siteId, fromMs, toMs, bh) {
   const siteEvents = state.events
     .filter(e => e.siteId === siteId)
     .sort((a, b) => a.ts - b.ts);
-
-  // Determine the site's state at the start of the period
-  let stateAtFrom = false; // assume closed if no history
+  let stateAtFrom = false;
   for (const e of siteEvents) {
     if (e.ts <= fromMs) stateAtFrom = e.isOpen;
     else break;
   }
-
-  // Build a list of open/closed intervals covering [fromMs, toMs]
   const relevant = siteEvents.filter(e => e.ts > fromMs && e.ts <= toMs);
   const intervals = [];
   let curState = stateAtFrom;
   let curStart = fromMs;
-
   for (const e of relevant) {
     intervals.push({ isOpen: curState, start: curStart, end: e.ts });
     curState = e.isOpen;
     curStart = e.ts;
   }
   intervals.push({ isOpen: curState, start: curStart, end: toMs });
-
   let openMins = 0, closedMins = 0;
   for (const iv of intervals) {
     const m = calcBusinessMinutes(iv.start, iv.end, bh);
     if (iv.isOpen) openMins += m; else closedMins += m;
   }
-
   return { openMins: Math.round(openMins), closedMins: Math.round(closedMins) };
 }
+
+// ---------------------------------------------------------------------------
+// Express setup
+// ---------------------------------------------------------------------------
+
+app.disable('x-powered-by');
+app.use(express.json());
+
+app.use(session({
+  secret:            SESSION_SECRET,
+  resave:            false,
+  saveUninitialized: false,
+  cookie: {
+    httpOnly:  true,
+    sameSite:  'lax',
+    secure:    process.env.NODE_ENV === 'production',
+    maxAge:    8 * 60 * 60 * 1000, // 8 hours
+  },
+}));
+
+// Security headers on every response
+app.use((req, res, next) => {
+  res.set('X-Content-Type-Options', 'nosniff');
+  res.set('X-Frame-Options', 'DENY');
+  res.set('Content-Security-Policy', "default-src 'self'; style-src 'unsafe-inline'");
+  next();
+});
+
+// ---------------------------------------------------------------------------
+// Auth middleware
+// ---------------------------------------------------------------------------
+
+// Protects admin pages and write API endpoints.
+// Uses OIDC session when configured; falls back to HTTP Basic Auth otherwise.
+function requireAuth(req, res, next) {
+  if (oidcClient) {
+    // OIDC mode: check for a valid session
+    if (req.session && req.session.user) return next();
+    if (req.path.startsWith('/api/')) {
+      return res.status(401).json({ error: 'Session expired — please reload and log in again.' });
+    }
+    req.session.returnTo = req.originalUrl;
+    return res.redirect('/auth/login');
+  } else {
+    // Basic Auth fallback
+    const authHeader = req.headers['authorization'] || '';
+    if (authHeader.startsWith('Basic ')) {
+      const decoded  = Buffer.from(authHeader.slice(6), 'base64').toString('utf8');
+      const colonIdx = decoded.indexOf(':');
+      const pass     = colonIdx === -1 ? '' : decoded.slice(colonIdx + 1);
+      const a = Buffer.from(pass);
+      const b = Buffer.from(ADMIN_PASSWORD);
+      if (a.length === b.length && crypto.timingSafeEqual(a, b)) return next();
+    }
+    res.set('WWW-Authenticate', 'Basic realm="Help Desk Admin"');
+    return res.status(401).send('Authentication required');
+  }
+}
+
+// CSRF guard for state-changing API endpoints.
+// Our own fetch() calls include this header; cross-origin CSRF requests
+// cannot set arbitrary headers without a CORS preflight that we never grant.
+function requireXHR(req, res, next) {
+  if (req.headers['x-requested-with'] !== 'XMLHttpRequest') {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  next();
+}
+
+// ---------------------------------------------------------------------------
+// Rate limiting (in-memory, per-IP)
+// ---------------------------------------------------------------------------
+
+const _rateMap = new Map();
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, e] of _rateMap) if (now > e.resetAt) _rateMap.delete(ip);
+}, 5 * 60 * 1000).unref();
+
+function rateLimit(req, res, next) {
+  const ip  = req.ip || req.socket.remoteAddress || 'unknown';
+  const now = Date.now();
+  let e = _rateMap.get(ip);
+  if (!e || now > e.resetAt) { e = { count: 0, resetAt: now + RATE_LIMIT_WINDOW }; _rateMap.set(ip, e); }
+  if (++e.count > RATE_LIMIT_MAX) return res.status(429).json({ error: 'Too many requests — slow down.' });
+  next();
+}
+
+// ---------------------------------------------------------------------------
+// OIDC auth routes  (/auth/login, /auth/callback, /auth/logout)
+// ---------------------------------------------------------------------------
+
+app.get('/auth/login', (req, res) => {
+  if (!oidcClient) return res.redirect('/admin');
+  const state = generators.state();
+  const nonce = generators.nonce();
+  req.session.oidcState = state;
+  req.session.oidcNonce = nonce;
+  res.redirect(oidcClient.authorizationUrl({ scope: 'openid email profile', state, nonce }));
+});
+
+app.get('/auth/callback', async (req, res) => {
+  if (!oidcClient) return res.redirect('/admin');
+  try {
+    const params   = oidcClient.callbackParams(req);
+    const tokenSet = await oidcClient.callback(
+      OIDC_REDIRECT_URI,
+      params,
+      { state: req.session.oidcState, nonce: req.session.oidcNonce }
+    );
+    const claims = tokenSet.claims();
+    req.session.user = {
+      email: claims.email || claims.preferred_username || 'unknown',
+      name:  claims.name  || claims.email || claims.preferred_username || 'Admin',
+    };
+    req.session.oidcState = null;
+    req.session.oidcNonce = null;
+    const returnTo = req.session.returnTo || '/admin';
+    req.session.returnTo = null;
+    res.redirect(returnTo);
+  } catch (err) {
+    console.error('[OIDC] Callback error:', err.message);
+    res.status(400).send('Authentication failed. <a href="/auth/login">Try again</a>');
+  }
+});
+
+app.get('/auth/logout', (req, res) => {
+  req.session.destroy(() => res.redirect('/'));
+});
 
 // ---------------------------------------------------------------------------
 // API – sites
@@ -145,9 +370,13 @@ app.get('/api/sites', (req, res) => {
   res.json(state.sites);
 });
 
-app.post('/api/sites', (req, res) => {
+app.post('/api/sites', requireAuth, requireXHR, rateLimit, (req, res) => {
+  if (state.sites.length >= MAX_SITES) {
+    return res.status(400).json({ error: `Maximum of ${MAX_SITES} sites reached` });
+  }
   const name = (req.body.name || '').trim();
   if (!name) return res.status(400).json({ error: 'name is required' });
+  if (name.length > MAX_NAME_LEN) return res.status(400).json({ error: `name must be ${MAX_NAME_LEN} characters or fewer` });
   const site = { id: uniqueId(name), name, isOpen: true, businessHours: defaultBusinessHours() };
   state.sites.push(site);
   state.events.push({ siteId: site.id, isOpen: true, ts: Date.now() });
@@ -155,15 +384,17 @@ app.post('/api/sites', (req, res) => {
   res.status(201).json(site);
 });
 
-app.delete('/api/sites/:id', (req, res) => {
+app.delete('/api/sites/:id', requireAuth, requireXHR, rateLimit, (req, res) => {
   const idx = state.sites.findIndex(s => s.id === req.params.id);
   if (idx === -1) return res.status(404).json({ error: 'not found' });
+  const siteId = state.sites[idx].id;
   state.sites.splice(idx, 1);
+  state.events = state.events.filter(e => e.siteId !== siteId); // clean up orphaned events
   saveState();
   res.json({ ok: true });
 });
 
-app.post('/api/sites/:id/toggle', (req, res) => {
+app.post('/api/sites/:id/toggle', requireAuth, requireXHR, rateLimit, (req, res) => {
   const site = state.sites.find(s => s.id === req.params.id);
   if (!site) return res.status(404).json({ error: 'not found' });
   site.isOpen = !site.isOpen;
@@ -176,19 +407,26 @@ app.post('/api/sites/:id/toggle', (req, res) => {
 // API – business hours & reporting
 // ---------------------------------------------------------------------------
 
-app.post('/api/sites/:id/business-hours', (req, res) => {
+app.post('/api/sites/:id/business-hours', requireAuth, requireXHR, rateLimit, (req, res) => {
   const site = state.sites.find(s => s.id === req.params.id);
   if (!site) return res.status(404).json({ error: 'not found' });
   const { start, end, days } = req.body;
-  if (!start || !end || !Array.isArray(days)) {
-    return res.status(400).json({ error: 'start, end, and days are required' });
+  if (!TIME_RE.test(start) || !TIME_RE.test(end)) {
+    return res.status(400).json({ error: 'start and end must be HH:MM' });
   }
-  site.businessHours = { start, end, days: days.map(Number) };
+  if (!Array.isArray(days)) {
+    return res.status(400).json({ error: 'days must be an array' });
+  }
+  const daysNums = [...new Set(days.map(Number))];
+  if (daysNums.some(d => !Number.isInteger(d) || d < 0 || d > 6)) {
+    return res.status(400).json({ error: 'days must contain integers 0 (Sun) through 6 (Sat)' });
+  }
+  site.businessHours = { start, end, days: daysNums };
   saveState();
   res.json(site.businessHours);
 });
 
-app.get('/api/report', (req, res) => {
+app.get('/api/report', requireAuth, (req, res) => {
   const { from, to } = req.query;
   if (!from || !to) return res.status(400).json({ error: 'from and to are required' });
 
@@ -199,6 +437,9 @@ app.get('/api/report', (req, res) => {
 
   if (isNaN(fromMs) || isNaN(toMs) || toMs < fromMs) {
     return res.status(400).json({ error: 'invalid date range' });
+  }
+  if (toMs - fromMs > MAX_RANGE_MS) {
+    return res.status(400).json({ error: 'date range cannot exceed 2 years' });
   }
 
   const sites = state.sites.map(site => {
@@ -387,7 +628,11 @@ app.get('/site/:id', (req, res) => {
 // Admin page  –  manage all sites
 // ---------------------------------------------------------------------------
 
-app.get('/admin', (req, res) => {
+app.get('/admin', requireAuth, (req, res) => {
+  const userInfo = oidcClient && req.session.user
+    ? `<span class="user-info">\u{1F464} ${escHtml(req.session.user.name)}</span><a href="/auth/logout" class="logout-link">Sign out</a>`
+    : '';
+
   res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -408,9 +653,11 @@ app.get('/admin', (req, res) => {
       gap: 1.5rem;
     }
     h1 { font-size: 1.6rem; letter-spacing: 0.05em; color: #89b4fa; }
-    .nav-links { display: flex; gap: 1.5rem; }
+    .nav-links { display: flex; gap: 1.5rem; align-items: center; flex-wrap: wrap; justify-content: center; }
     .nav-links a { color: #89b4fa; font-size: 0.9rem; text-decoration: none; }
     .nav-links a:hover { text-decoration: underline; }
+    .user-info { font-size: 0.85rem; color: #a6adc8; }
+    .logout-link { color: #f38ba8 !important; }
     #sites-list { width: 100%; max-width: 620px; display: flex; flex-direction: column; gap: 0.75rem; }
     .site-row {
       background: #2a2a3d;
@@ -471,6 +718,7 @@ app.get('/admin', (req, res) => {
   <div class="nav-links">
     <a href="/">&#8592; Public overview</a>
     <a href="/admin/report">&#128202; Reports</a>
+    ${userInfo}
   </div>
   <div id="sites-list"></div>
   <div id="add-form">
@@ -479,11 +727,17 @@ app.get('/admin', (req, res) => {
   </div>
   <div id="feedback"></div>
   <script>
+    const XHR_HEADER = { 'X-Requested-With': 'XMLHttpRequest' };
     let sites = [];
     const list     = document.getElementById('sites-list');
     const feedback = document.getElementById('feedback');
     function esc(s) {
       return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }
+    async function apiFetch(url, opts = {}) {
+      const res = await fetch(url, opts);
+      if (res.status === 401) { window.location.href = '/auth/login'; throw new Error('session expired'); }
+      return res;
     }
     function render() {
       list.innerHTML = '';
@@ -520,7 +774,10 @@ app.get('/admin', (req, res) => {
       if (e.target.type !== 'checkbox') return;
       const id = e.target.dataset.id;
       try {
-        const updated = await fetch('/api/sites/' + id + '/toggle', { method: 'POST' }).then(r => r.json());
+        const updated = await apiFetch('/api/sites/' + id + '/toggle', {
+          method: 'POST',
+          headers: XHR_HEADER,
+        }).then(r => r.json());
         const s = sites.find(s => s.id === id);
         if (s) s.isOpen = updated.isOpen;
         const lbl = document.getElementById('lbl-' + id);
@@ -528,7 +785,7 @@ app.get('/admin', (req, res) => {
         e.target.checked = updated.isOpen;
         feedback.textContent = esc(updated.name) + ' marked as ' + (updated.isOpen ? 'OPEN' : 'CLOSED') + '.';
       } catch (err) {
-        feedback.textContent = 'Error \u2014 please try again.';
+        if (err.message !== 'session expired') feedback.textContent = 'Error \u2014 please try again.';
         e.target.checked = !e.target.checked;
       }
     });
@@ -539,28 +796,32 @@ app.get('/admin', (req, res) => {
       const site = sites.find(s => s.id === id);
       if (!confirm('Delete "' + (site ? site.name : id) + '"?')) return;
       try {
-        await fetch('/api/sites/' + id, { method: 'DELETE' });
+        await apiFetch('/api/sites/' + id, { method: 'DELETE', headers: XHR_HEADER });
         sites = sites.filter(s => s.id !== id);
         render();
         feedback.textContent = 'Site deleted.';
-      } catch (err) { feedback.textContent = 'Error \u2014 please try again.'; }
+      } catch (err) {
+        if (err.message !== 'session expired') feedback.textContent = 'Error \u2014 please try again.';
+      }
     });
     document.getElementById('add-btn').addEventListener('click', async () => {
       const input = document.getElementById('new-site-name');
       const name  = input.value.trim();
       if (!name) { feedback.textContent = 'Please enter a site name.'; return; }
       try {
-        const site = await fetch('/api/sites', {
+        const site = await apiFetch('/api/sites', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', ...XHR_HEADER },
           body: JSON.stringify({ name }),
         }).then(r => r.json());
         if (site.error) { feedback.textContent = site.error; return; }
         sites.push(site);
         render();
         input.value = '';
-        feedback.textContent = 'Site "' + site.name + '" added. Public URL: /site/' + site.id;
-      } catch (err) { feedback.textContent = 'Error \u2014 please try again.'; }
+        feedback.textContent = 'Site "' + esc(site.name) + '" added. Public URL: /site/' + esc(site.id);
+      } catch (err) {
+        if (err.message !== 'session expired') feedback.textContent = 'Error \u2014 please try again.';
+      }
     });
     document.getElementById('new-site-name').addEventListener('keydown', e => {
       if (e.key === 'Enter') document.getElementById('add-btn').click();
@@ -576,7 +837,11 @@ app.get('/admin', (req, res) => {
 // Admin report page  –  business hours config + open/closed time reporting
 // ---------------------------------------------------------------------------
 
-app.get('/admin/report', (req, res) => {
+app.get('/admin/report', requireAuth, (req, res) => {
+  const userInfo = oidcClient && req.session.user
+    ? `<span class="user-info">\u{1F464} ${escHtml(req.session.user.name)}</span><a href="/auth/logout" class="logout-link">Sign out</a>`
+    : '';
+
   res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -598,8 +863,11 @@ app.get('/admin/report', (req, res) => {
     }
     h1 { font-size: 1.6rem; letter-spacing: 0.05em; color: #89b4fa; }
     h2 { font-size: 1rem; text-transform: uppercase; letter-spacing: 0.07em; color: #89b4fa; margin-bottom: 1rem; }
-    a.back { color: #89b4fa; font-size: 0.9rem; text-decoration: none; }
-    a.back:hover { text-decoration: underline; }
+    .nav-links { display: flex; gap: 1.5rem; align-items: center; flex-wrap: wrap; justify-content: center; }
+    .nav-links a { color: #89b4fa; font-size: 0.9rem; text-decoration: none; }
+    .nav-links a:hover { text-decoration: underline; }
+    .user-info { font-size: 0.85rem; color: #a6adc8; }
+    .logout-link { color: #f38ba8 !important; }
     .card {
       background: #2a2a3d;
       border-radius: 0.75rem;
@@ -687,7 +955,10 @@ app.get('/admin/report', (req, res) => {
 </head>
 <body>
   <h1>Help Desk Reports</h1>
-  <a class="back" href="/admin">&#8592; Back to Admin</a>
+  <div class="nav-links">
+    <a href="/admin">&#8592; Back to Admin</a>
+    ${userInfo}
+  </div>
 
   <!-- Per-site business hours config -->
   <div class="card">
@@ -739,6 +1010,8 @@ app.get('/admin/report', (req, res) => {
   <div id="error-msg"></div>
 
   <script>
+    const XHR_HEADER = { 'X-Requested-With': 'XMLHttpRequest' };
+
     // ---- helpers ----
     function esc(s) {
       return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -752,6 +1025,11 @@ app.get('/admin/report', (req, res) => {
       return d.getFullYear() + '-' +
         String(d.getMonth() + 1).padStart(2, '0') + '-' +
         String(d.getDate()).padStart(2, '0');
+    }
+    async function apiFetch(url, opts = {}) {
+      const res = await fetch(url, opts);
+      if (res.status === 401) { window.location.href = '/auth/login'; throw new Error('session expired'); }
+      return res;
     }
 
     // ---- per-site business hours ----
@@ -775,7 +1053,7 @@ app.get('/admin/report', (req, res) => {
       }
       for (const site of sitesData) {
         const bh = site.businessHours || { start: '08:00', end: '17:00', days: [1,2,3,4,5] };
-        const activeDays = new Set(bh.days); // per-site, captured in closure
+        const activeDays = new Set(bh.days); // per-site closure
 
         const row = document.createElement('div');
         row.className = 'site-bh-row';
@@ -806,9 +1084,9 @@ app.get('/admin/report', (req, res) => {
         row.querySelector('.save-bh-btn').addEventListener('click', async () => {
           const note = row.querySelector('.bh-note');
           try {
-            const updated = await fetch('/api/sites/' + site.id + '/business-hours', {
+            const updated = await apiFetch('/api/sites/' + site.id + '/business-hours', {
               method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
+              headers: { 'Content-Type': 'application/json', ...XHR_HEADER },
               body: JSON.stringify({
                 start: row.querySelector('.bh-start').value,
                 end:   row.querySelector('.bh-end').value,
@@ -819,7 +1097,9 @@ app.get('/admin/report', (req, res) => {
             if (s) s.businessHours = updated;
             note.textContent = 'Saved!';
             setTimeout(() => { note.textContent = ''; }, 2000);
-          } catch (e) { note.querySelector('.bh-note').textContent = 'Error saving.'; }
+          } catch (e) {
+            if (e.message !== 'session expired') note.textContent = 'Error saving.';
+          }
         });
 
         container.appendChild(row);
@@ -873,10 +1153,12 @@ app.get('/admin/report', (req, res) => {
       errEl.textContent = '';
       if (!from || !to) { errEl.textContent = 'Please select a date range.'; return; }
       try {
-        const data = await fetch('/api/report?from=' + from + '&to=' + to).then(r => r.json());
+        const data = await apiFetch('/api/report?from=' + from + '&to=' + to).then(r => r.json());
         if (data.error) { errEl.textContent = data.error; return; }
         renderReport(data, from, to);
-      } catch (e) { errEl.textContent = 'Error generating report.'; }
+      } catch (e) {
+        if (e.message !== 'session expired') errEl.textContent = 'Error generating report.';
+      }
     });
 
     function renderReport(data, from, to) {
@@ -920,9 +1202,20 @@ app.get('/admin/report', (req, res) => {
 
 // ---------------------------------------------------------------------------
 
-app.listen(PORT, () => {
-  console.log(`Help Desk Status running at http://localhost:${PORT}`);
-  console.log(`  Public overview : http://localhost:${PORT}/`);
-  console.log(`  Admin panel     : http://localhost:${PORT}/admin`);
-  console.log(`  Reports         : http://localhost:${PORT}/admin/report`);
+async function start() {
+  await initOIDC();
+  app.listen(PORT, () => {
+    console.log(`Help Desk Status running at http://localhost:${PORT}`);
+    console.log(`  Public overview : http://localhost:${PORT}/`);
+    console.log(`  Admin panel     : http://localhost:${PORT}/admin`);
+    console.log(`  Reports         : http://localhost:${PORT}/admin/report`);
+    if (oidcClient) {
+      console.log(`  OIDC callback   : ${OIDC_REDIRECT_URI}`);
+    }
+  });
+}
+
+start().catch(err => {
+  console.error('Fatal startup error:', err);
+  process.exit(1);
 });
