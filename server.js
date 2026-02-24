@@ -4,7 +4,7 @@ const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const STATE_FILE = path.join(__dirname, 'state.json');
+const STATE_FILE = process.env.STATE_FILE || path.join(__dirname, 'state.json');
 
 app.use(express.json());
 

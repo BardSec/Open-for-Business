@@ -1,0 +1,13 @@
+services:
+  helpdesk:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - STATE_FILE=/app/state/state.json
+    volumes:
+      - helpdesk-state:/app/state
+    restart: unless-stopped
+
+volumes:
+  helpdesk-state:
