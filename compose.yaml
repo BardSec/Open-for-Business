@@ -6,6 +6,7 @@ services:
     env_file: .env
     environment:
       - STATE_FILE=/app/state/state.json
+      - NODE_ENV=production
     volumes:
       - helpdesk-state:/app/state
     restart: unless-stopped

@@ -45,6 +45,22 @@ if (!ADMIN_PASSWORD) {
   console.warn('[SECURITY] Set ADMIN_PASSWORD env var to make it persistent.');
 }
 
+// OIDC user allowlist — checked at login time.
+// If neither var is set, any user the provider authenticates becomes admin.
+//   OIDC_ALLOWED_EMAILS  – comma-separated list:  alice@school.org,bob@school.org
+//   OIDC_ALLOWED_DOMAIN  – email domain suffix:   school.org
+const OIDC_ALLOWED_EMAILS = (process.env.OIDC_ALLOWED_EMAILS || '')
+  .split(',').map(e => e.trim().toLowerCase()).filter(Boolean);
+const OIDC_ALLOWED_DOMAIN = (process.env.OIDC_ALLOWED_DOMAIN || '').toLowerCase().trim();
+
+function isAllowedOIDCUser(email) {
+  if (!OIDC_ALLOWED_EMAILS.length && !OIDC_ALLOWED_DOMAIN) return true;
+  const e = (email || '').toLowerCase();
+  if (OIDC_ALLOWED_EMAILS.length && OIDC_ALLOWED_EMAILS.includes(e)) return true;
+  if (OIDC_ALLOWED_DOMAIN && e.endsWith('@' + OIDC_ALLOWED_DOMAIN)) return true;
+  return false;
+}
+
 // Filled in by initOIDC() if env vars are present
 let oidcClient = null;
 
@@ -71,6 +87,10 @@ async function initOIDC() {
       response_types: ['code'],
     });
     console.log(`[AUTH] OIDC SSO configured. Issuer: ${issuer.metadata.issuer}`);
+    if (!OIDC_ALLOWED_EMAILS.length && !OIDC_ALLOWED_DOMAIN) {
+      console.warn('[SECURITY] OIDC allowlist not configured — any authenticated tenant user has admin access.');
+      console.warn('[SECURITY] Set OIDC_ALLOWED_EMAILS or OIDC_ALLOWED_DOMAIN to restrict access.');
+    }
   } catch (err) {
     console.error(`[AUTH] OIDC discovery failed: ${err.message}`);
     process.exit(1);
@@ -240,6 +260,7 @@ function calcSiteReport(siteId, fromMs, toMs, bh) {
 // ---------------------------------------------------------------------------
 
 app.disable('x-powered-by');
+app.set('trust proxy', 1); // one reverse-proxy hop (nginx/Caddy); lets req.ip see real client IPs
 app.use(express.json());
 
 app.use(session({
@@ -258,7 +279,11 @@ app.use(session({
 app.use((req, res, next) => {
   res.set('X-Content-Type-Options', 'nosniff');
   res.set('X-Frame-Options', 'DENY');
+  res.set('Referrer-Policy', 'same-origin');
   res.set('Content-Security-Policy', "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'");
+  if (process.env.NODE_ENV === 'production') {
+    res.set('Strict-Transport-Security', 'max-age=63072000; includeSubDomains');
+  }
   next();
 });
 
@@ -345,15 +370,28 @@ app.get('/auth/callback', async (req, res) => {
       { state: req.session.oidcState, nonce: req.session.oidcNonce }
     );
     const claims = tokenSet.claims();
-    req.session.user = {
-      email: claims.email || claims.preferred_username || 'unknown',
-      name:  claims.name  || claims.email || claims.preferred_username || 'Admin',
-    };
-    req.session.oidcState = null;
-    req.session.oidcNonce = null;
+    const email   = claims.email || claims.preferred_username || '';
+
+    if (!isAllowedOIDCUser(email)) {
+      console.warn(`[AUTH] OIDC login denied for: ${email}`);
+      return res.status(403).send(
+        'Access denied. Your account is not authorised to manage this help desk. ' +
+        '<a href="/">Return to status page</a>'
+      );
+    }
+
+    const user     = { email, name: claims.name || email || 'Admin' };
     const returnTo = req.session.returnTo || '/admin';
-    req.session.returnTo = null;
-    res.redirect(returnTo);
+
+    // Regenerate the session ID to prevent session fixation attacks.
+    req.session.regenerate((err) => {
+      if (err) {
+        console.error('[OIDC] Session regeneration failed:', err.message);
+        return res.status(500).send('Authentication error. <a href="/auth/login">Try again</a>');
+      }
+      req.session.user = user;
+      res.redirect(returnTo);
+    });
   } catch (err) {
     console.error('[OIDC] Callback error:', err.message);
     res.status(400).send('Authentication failed. <a href="/auth/login">Try again</a>');
@@ -428,7 +466,7 @@ app.post('/api/sites/:id/business-hours', requireAuth, requireXHR, rateLimit, (r
   res.json(site.businessHours);
 });
 
-app.get('/api/report', requireAuth, (req, res) => {
+app.get('/api/report', requireAuth, rateLimit, (req, res) => {
   const { from, to } = req.query;
   if (!from || !to) return res.status(400).json({ error: 'from and to are required' });
 
